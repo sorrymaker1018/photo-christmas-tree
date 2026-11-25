@@ -1,1 +1,1 @@
-photo-christmas-tree build 2026-11-25b local-photo-store
+photo-christmas-tree build 2026-11-25c gesture-diagnostics
