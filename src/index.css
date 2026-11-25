@@ -1,0 +1,229 @@
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  overflow: hidden;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: #FFD700;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+canvas {
+  display: block;
+}
+
+/* 轻量模式标识 */
+.hud-lite {
+  position: absolute;
+  top: calc(12px + env(safe-area-inset-top));
+  left: 14px;
+  z-index: 10;
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: rgba(124, 255, 178, 0.75);
+  border: 1px solid rgba(124, 255, 178, 0.35);
+  background: rgba(0, 30, 15, 0.5);
+  padding: 3px 8px;
+  border-radius: 999px;
+  pointer-events: none;
+}
+
+/* 左上角统计 */
+.hud-stats {
+  position: absolute;
+  top: calc(16px + env(safe-area-inset-top));
+  left: 18px;
+  z-index: 10;
+  pointer-events: none;
+}
+.hud-label {
+  font-size: 9px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: #777;
+  margin: 0 0 2px;
+}
+.hud-value {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  color: #FFD700;
+}
+.hud-value span {
+  font-size: 9px;
+  color: #555;
+  font-weight: 400;
+  letter-spacing: 1px;
+}
+
+/* 顶部状态 */
+.hud-status {
+  position: absolute;
+  top: calc(14px + env(safe-area-inset-top));
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 10px;
+  letter-spacing: 2px;
+  background: rgba(0, 0, 0, 0.55);
+  border: 1px solid rgba(255, 215, 0, 0.25);
+  padding: 5px 10px;
+  border-radius: 999px;
+  z-index: 10;
+  white-space: nowrap;
+  max-width: 88vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 手势提示 */
+.hud-hint {
+  position: absolute;
+  bottom: calc(84px + env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: rgba(255, 215, 0, 0.7);
+  background: rgba(0, 0, 0, 0.55);
+  padding: 6px 12px;
+  border-radius: 999px;
+  z-index: 10;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* 底部操作栏 */
+.hud-bottom {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 20;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  padding: 14px 14px calc(14px + env(safe-area-inset-bottom));
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.75), rgba(0, 0, 0, 0));
+}
+
+.chip {
+  appearance: none;
+  -webkit-appearance: none;
+  min-height: 44px;
+  padding: 0 18px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 215, 0, 0.45);
+  background: rgba(0, 0, 0, 0.55);
+  color: #FFD700;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  font-family: inherit;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  transition: transform 0.15s, background 0.2s;
+}
+.chip:active { transform: scale(0.96); }
+.chip:disabled { opacity: 0.6; }
+.chip.primary {
+  background: linear-gradient(180deg, #FFD700, #d4a900);
+  color: #1a1300;
+  border-color: #FFD700;
+}
+.chip.on {
+  background: #FFD700;
+  color: #000;
+}
+
+/* 手势识别结果 */
+.hud-detected {
+  position: absolute;
+  top: calc(46px + env(safe-area-inset-top));
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 12px;
+  letter-spacing: 2px;
+  color: #7CFFB2;
+  background: rgba(0, 40, 20, 0.65);
+  border: 1px solid rgba(124, 255, 178, 0.4);
+  padding: 5px 12px;
+  border-radius: 999px;
+  z-index: 11;
+  white-space: nowrap;
+}
+
+/* 照片放大查看 */
+.viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.92);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.viewer-stage {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+  cursor: grab;
+}
+.viewer-img {
+  max-width: 82vw;
+  max-height: 68vh;
+  object-fit: contain;
+  border: 10px solid #fff;
+  border-radius: 2px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.8);
+  will-change: transform;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+.viewer-close {
+  position: absolute;
+  top: calc(14px + env(safe-area-inset-top));
+  right: 16px;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 215, 0, 0.5);
+  background: rgba(0, 0, 0, 0.6);
+  color: #FFD700;
+  font-size: 24px;
+  line-height: 1;
+  z-index: 2;
+}
+.viewer-hint {
+  position: absolute;
+  bottom: calc(24px + env(safe-area-inset-bottom));
+  margin: 0;
+  color: rgba(255, 215, 0, 0.6);
+  font-size: 12px;
+  letter-spacing: 1px;
+  pointer-events: none;
+}
+
+@media (max-width: 640px) {
+  .hud-stats { display: none; }
+  .hud-hint { bottom: calc(96px + env(safe-area-inset-bottom)); font-size: 10px; }
+  .chip { padding: 0 14px; font-size: 12px; min-height: 42px; }
+  .viewer-img { max-width: 88vw; max-height: 62vh; border-width: 8px; }
+}
