@@ -14,6 +14,10 @@ import { MathUtils } from 'three';
 import * as random from 'maath/random';
 import { GestureRecognizer, FilesetResolver, DrawingUtils } from "@mediapipe/tasks-vision";
 import { addPhotos, clearPhotos as clearStoredPhotos, listPhotos, requestPersistence, type PhotoItem } from './photoStore';
+import {
+  createShare, deleteShare, fetchShare, forgetShare, listShareRecords, readShareIdFromUrl,
+  rememberShare, sharePageUrl, sharePhotoUrl
+} from './shareApi';
 
 // --- 设备分级：低配手机自动进入轻量模式 ---
 const IS_SMALL_SCREEN = typeof window !== 'undefined'
@@ -28,7 +32,7 @@ const IS_LOW_END = FORCE_LITE || (!FORCE_FULL && IS_SMALL_SCREEN && ((DEVICE_MEM
 // 微信内置浏览器基本不允许网页调用摄像头，先直接提示换浏览器
 const IS_WECHAT = typeof navigator !== 'undefined' && /MicroMessenger/i.test(navigator.userAgent);
 // 版本标记，方便确认手机上是不是新版本
-const BUILD_TAG = 'v25c';
+const BUILD_TAG = 'v26a';
 
 // --- 默认照片列表（用小尺寸图，省显存；用户上传后整体替换） ---
 const BASE = import.meta.env.BASE_URL;
@@ -557,6 +561,7 @@ const GestureController = ({ onGesture, onMove, onStatus, onDetect, onPinch, pin
     let lastEmitted = '';
     let fpsCount = 0;
     let fpsAt = performance.now();
+    let lastHandAt = 0;
 
     const dist = (a: any, b: any) => Math.hypot(a.x - b.x, a.y - b.y);
     // 用 21 个手部关键点自己数伸出的手指，模型置信度低时兜底
@@ -569,12 +574,12 @@ const GestureController = ({ onGesture, onMove, onStatus, onDetect, onPinch, pin
       return n;
     };
 
-    const emit = (name: string) => {
+    const emit = (name: string, score: number) => {
       const now = performance.now();
       if (name === candidate) candidateHits += 1;
       else { candidate = name; candidateHits = 1; }
-      if (candidateHits < 3) return;          // 连续 3 帧一致才触发，过滤抖动
-      if (now - lastEmitAt < 700) return;     // 冷却，避免来回跳
+      if (candidateHits < 2 && score < 0.82) return;  // 高置信度一帧就走，普通要连续 2 帧
+      if (now - lastEmitAt < 500) return;             // 冷却，避免来回跳
       if (name === lastEmitted && now - lastEmitAt < 2500) return;
       lastEmitAt = now;
       lastEmitted = name;
@@ -621,6 +626,7 @@ const GestureController = ({ onGesture, onMove, onStatus, onDetect, onPinch, pin
       const pinching = !!pinchActiveRef.current;
 
       if (lm) {
+        lastHandAt = performance.now();
         // 拇指尖(4) 与食指尖(8) 的距离 / 手掌尺寸 → 捏合张开程度（0.1≈捏紧，0.6≈完全张开）
         const handScale = dist(lm[0], lm[9]) || 0.001;
         const raw = dist(lm[4], lm[8]) / handScale;
@@ -653,7 +659,7 @@ const GestureController = ({ onGesture, onMove, onStatus, onDetect, onPinch, pin
         if (debugRef.current) onStatus(pinching ? 'AI 就绪 · 手势缩放待检测' : 'AI 就绪 · 未检测到手');
       }
 
-      if (!pinching && score >= 0.55 && (name === 'Closed_Fist' || name === 'Open_Palm')) emit(name);
+      if (!pinching && score >= 0.55 && (name === 'Closed_Fist' || name === 'Open_Palm')) emit(name, score);
 
       // 帧率回显：让你一眼确认推理真的在跑（不显示帧率就是没跑起来）
       if (!pinching) {
@@ -661,7 +667,8 @@ const GestureController = ({ onGesture, onMove, onStatus, onDetect, onPinch, pin
         const nowMs = performance.now();
         if (nowMs - fpsAt >= 1500) {
           const fps = Math.round((fpsCount * 1000) / (nowMs - fpsAt));
-          onStatus(`AI 就绪 · ${fps} 帧/秒`);
+          const handTxt = performance.now() - lastHandAt > 4000 ? ' · 未检测到手' : '';
+          onStatus(`AI 就绪 · ${fps} 帧/秒${handTxt}`);
           fpsCount = 0;
           fpsAt = nowMs;
         }
@@ -693,18 +700,45 @@ const GestureController = ({ onGesture, onMove, onStatus, onDetect, onPinch, pin
       }
     };
 
+    // 带进度下载模型（8.4MB，手机上要几秒，给百分比免得以为卡死）
+    const fetchModelBuffer = async (url: string) => {
+      const res = await fetch(url, { cache: 'force-cache' });
+      if (!res.ok || !res.body) throw new Error(`模型下载失败 HTTP ${res.status}`);
+      const total = Number(res.headers.get('content-length') || 0);
+      const reader = res.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let received = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+          received += value.byteLength;
+          onStatus(total
+            ? `加载手势模型 ${Math.min(99, Math.round((received / total) * 100))}%`
+            : `加载手势模型 ${(received / 1048576).toFixed(1)}MB`);
+        }
+      }
+      const out = new Uint8Array(received);
+      let off = 0;
+      for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+      return out;
+    };
+
     const setup = async () => {
-      onStatus('加载手势模型中…');
+      onStatus('加载手势引擎…');
       try {
         const vision = await FilesetResolver.forVisionTasks(`${BASE}mediapipe/wasm`);
+        const modelBuffer = await fetchModelBuffer(`${BASE}models/gesture_recognizer.task`);
+        if (cancelled) return;
         const makeRecognizer = (delegate: 'GPU' | 'CPU') => GestureRecognizer.createFromOptions(vision, {
-          baseOptions: { modelAssetPath: `${BASE}models/gesture_recognizer.task`, delegate },
+          baseOptions: { modelAssetBuffer: modelBuffer, delegate },
           runningMode: 'VIDEO',
           numHands: 1,
           // 调低门槛，手离得远一点、光线差一点也能先“抓住”手
-          minHandDetectionConfidence: 0.4,
-          minHandPresenceConfidence: 0.4,
-          minTrackingConfidence: 0.4
+          minHandDetectionConfidence: 0.3,
+          minHandPresenceConfidence: 0.3,
+          minTrackingConfidence: 0.35
         });
         // 手机上 CPU 推理最稳（Safari 的 GPU 委托兼容性差），只有桌面浏览器才用 GPU
         const preferred: 'GPU' | 'CPU' = IS_SMALL_SCREEN ? 'CPU' : 'GPU';
@@ -916,6 +950,98 @@ const PhotoViewer = ({ src, onClose }: { src: string; onClose: () => void }) => 
   );
 };
 
+// --- 分享链接弹窗：链接带随机口令，只有拿到链接的人能看到 ---
+const ShareDialog = ({ link, count, onClose }: { link: string; count: number; onClose: () => void }) => {
+  const [tip, setTip] = useState('');
+  const timer = useRef<number | undefined>(undefined);
+  useEffect(() => () => { if (timer.current) window.clearTimeout(timer.current); }, []);
+
+  const copy = async () => {
+    const done = (m: string) => {
+      setTip(m);
+      if (timer.current) window.clearTimeout(timer.current);
+      timer.current = window.setTimeout(() => setTip(''), 2600);
+    };
+    try {
+      await navigator.clipboard.writeText(link);
+      done('已复制 · 去微信粘贴给朋友');
+    } catch {
+      done('复制失败 · 长按下面链接手动复制');
+    }
+  };
+
+  return (
+    <div className="share-mask" onClick={onClose}>
+      <div className="share-card" onClick={(e) => e.stopPropagation()}>
+        <h3>分享链接已生成</h3>
+        <p className="share-sub">这批照片（{count} 张）已经上传，链接里带随机口令，只有拿到链接的人能看到；30 天后自动失效。</p>
+        <div className="share-link">{link}</div>
+        <div className="share-actions">
+          <button className="chip primary" onClick={copy}>复制链接</button>
+          <button className="chip" onClick={onClose}>关闭</button>
+        </div>
+        {tip && <p className="share-tip">{tip}</p>}
+      </div>
+    </div>
+  );
+};
+
+// --- 我的分享：随时撤销某一条链接 ---
+const MySharesDialog = ({ onClose }: { onClose: () => void }) => {
+  const [rows, setRows] = useState(listShareRecords());
+  const [tip, setTip] = useState('');
+
+  const revoke = async (r: { id: string; mk: string }) => {
+    if (!window.confirm('撤销这条分享？对方再打开就看不到照片了。')) return;
+    try {
+      await deleteShare(r.id, r.mk);
+      forgetShare(r.id);
+      setRows(listShareRecords());
+      setTip('已撤销');
+    } catch {
+      setTip('撤销失败，稍后再试');
+    }
+    window.setTimeout(() => setTip(''), 2200);
+  };
+
+  const copy = async (id: string) => {
+    try {
+      await navigator.clipboard.writeText(sharePageUrl(id));
+      setTip('链接已复制');
+    } catch {
+      setTip('复制失败，可长按链接');
+    }
+    window.setTimeout(() => setTip(''), 2200);
+  };
+
+  return (
+    <div className="share-mask" onClick={onClose}>
+      <div className="share-card" onClick={(e) => e.stopPropagation()}>
+        <h3>我创建的分享</h3>
+        {rows.length === 0 && <p className="share-sub">还没有分享记录。</p>}
+        {rows.map((r) => (
+          <div className="share-row" key={r.id}>
+            <div className="share-row-main">
+              <span className="share-row-id">{r.id}</span>
+              <span className="share-row-meta">
+                {new Date(r.at).toLocaleDateString()} · {r.count} 张
+              </span>
+            </div>
+            <div className="share-row-btns">
+              <button className="chip" onClick={() => copy(r.id)}>复制</button>
+              <button className="chip subtle" onClick={() => revoke(r)}>撤销</button>
+            </div>
+          </div>
+        ))}
+        <div className="share-actions">
+          <button className="chip" onClick={onClose}>关闭</button>
+        </div>
+        {tip && <p className="share-tip">{tip}</p>}
+      </div>
+    </div>
+  );
+};
+
 // --- 手机照片压缩（避免大图撑爆显存；产出 Blob 便于保存到本机） ---
 type Compressed = { blob: Blob; width: number; height: number };
 const compressImage = async (file: File): Promise<Compressed> => {
@@ -953,6 +1079,11 @@ export default function GrandTreeApp() {
   const [saveHint, setSaveHint] = useState('');
   const [selectedPhoto, setSelectedPhoto] = useState<string | null>(DEBUG_OPEN_VIEWER ? DEFAULT_PHOTO_PATHS[1] : null);
   const [detectedName, setDetectedName] = useState('');
+  const [sharedId, setSharedId] = useState('');
+  const [shareLink, setShareLink] = useState('');
+  const [shareCount, setShareCount] = useState(0);
+  const [sharing, setSharing] = useState(false);
+  const [mySharesOpen, setMySharesOpen] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const urlByIdRef = useRef<Map<number, string>>(new Map());
 
@@ -984,6 +1115,7 @@ export default function GrandTreeApp() {
 
   // 打开页面先读本机照片库：有就用自己的照片，没有就用示例图
   useEffect(() => {
+    if (readShareIdFromUrl()) return;   // 分享模式优先，不读本机相册
     let alive = true;
     (async () => {
       try {
@@ -1001,6 +1133,35 @@ export default function GrandTreeApp() {
       urlByIdRef.current.clear();
     };
   }, [applyPhotoSet]);
+
+  // 分享模式：从云端读取这一批照片（只读，不写本机相册）
+  useEffect(() => {
+    const id = readShareIdFromUrl();
+    if (!id) return;
+    let alive = true;
+    setSharedId(id);
+    setSaveHint('正在加载分享照片…');
+    (async () => {
+      try {
+        const m = await fetchShare(id);
+        if (!alive) return;
+        const urls = m.items.map((it) => sharePhotoUrl(id, it.i));
+        for (const url of Array.from(urlByIdRef.current.values())) URL.revokeObjectURL(url);
+        urlByIdRef.current.clear();
+        setPhotoUrls(urls.length ? urls : DEFAULT_PHOTO_PATHS);
+        setUploadCount(m.n);
+        setShareCount(m.n);
+        setSceneState('FORMED');
+        const days = Math.max(1, Math.ceil((m.createdAt + 30 * 86400000 - Date.now()) / 86400000));
+        setSaveHint(`分享相册 · ${m.n} 张 · 还剩 ${days} 天`);
+      } catch {
+        if (!alive) return;
+        setSaveHint('分享链接无效或已过期');
+        setSharedId('');
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
 
   // 保存结果提示：导入/清空 2.6 秒，加载已有照片 4.5 秒（免得一打开就错过）
   useEffect(() => {
@@ -1060,6 +1221,33 @@ export default function GrandTreeApp() {
     }
   };
 
+  // 生成分享链接：把这批照片上传到云端，只有拿到链接的人能看到
+  const handleCreateShare = async () => {
+    if (sharing || sharedId) return;
+    if (!uploadCount) { setSaveHint('先导入照片，再生成分享链接'); return; }
+    setSharing(true);
+    setSaveHint('正在上传照片…');
+    try {
+      let blobs: Blob[] = [];
+      try {
+        const stored = await listPhotos();
+        if (stored.length) blobs = stored.map((s) => s.blob);
+      } catch { /* 本机库不可用时直接从画面里的照片取 */ }
+      if (!blobs.length) {
+        blobs = await Promise.all(photoUrls.map(async (u) => (await fetch(u)).blob()));
+      }
+      const res = await createShare(blobs.slice(0, 40));
+      rememberShare({ id: res.id, mk: res.mk, at: Date.now(), count: res.count });
+      setShareCount(res.count);
+      setShareLink(sharePageUrl(res.id));
+      setSaveHint(`已生成分享链接 · ${res.count} 张 · 30 天有效`);
+    } catch (e: any) {
+      setSaveHint('生成分享失败：' + String((e && e.message) || e).slice(0, 36));
+    } finally {
+      setSharing(false);
+    }
+  };
+
   const handleDetect = useCallback((name: string) => {
     setDetectedName(
       name === 'Closed_Fist' ? '握拳 · 聚成树'
@@ -1112,6 +1300,8 @@ export default function GrandTreeApp() {
         <p className="hud-value">{uploadCount || DEFAULT_PHOTO_PATHS.length} <span>POLAROIDS</span></p>
       </div>
 
+      {sharedId && <div className="hud-share">分享相册 · {shareCount} 张 · 只读</div>}
+
       {/* 顶部 AI 状态 */}
       <div className="hud-status" style={{ color: aiStatus.includes('ERROR') || aiStatus.includes('需要') ? '#ff5555' : 'rgba(255,215,0,0.55)' }}>
         {aiStatus}
@@ -1134,6 +1324,8 @@ export default function GrandTreeApp() {
       </div>
 
       {selectedPhoto && <PhotoViewer src={selectedPhoto} onClose={() => setSelectedPhoto(null)} />}
+      {shareLink && <ShareDialog link={shareLink} count={shareCount} onClose={() => setShareLink('')} />}
+      {mySharesOpen && <MySharesDialog onClose={() => setMySharesOpen(false)} />}
 
       {/* 底部操作栏 */}
       <div className="hud-bottom">
@@ -1145,11 +1337,24 @@ export default function GrandTreeApp() {
           style={{ display: 'none' }}
           onChange={(e) => handleFiles(e.target.files)}
         />
-        <button className="chip primary" onClick={() => fileRef.current?.click()} disabled={uploading}>
-          {uploading ? '导入中…' : '＋ 导入照片'}
-        </button>
-        {uploadCount > 0 && (
+        {!sharedId && (
+          <button className="chip primary" onClick={() => fileRef.current?.click()} disabled={uploading}>
+            {uploading ? '导入中…' : '＋ 导入照片'}
+          </button>
+        )}
+        {!sharedId && uploadCount > 0 && (
           <button className="chip subtle" onClick={clearMyPhotos}>清空照片</button>
+        )}
+        {!sharedId && uploadCount > 0 && (
+          <button className="chip primary" onClick={handleCreateShare} disabled={sharing}>
+            {sharing ? '生成中…' : '生成分享链接'}
+          </button>
+        )}
+        {!sharedId && listShareRecords().length > 0 && (
+          <button className="chip subtle" onClick={() => setMySharesOpen(true)}>分享记录</button>
+        )}
+        {sharedId && (
+          <button className="chip" onClick={() => { location.href = location.pathname; }}>换成本机照片</button>
         )}
         <button className="chip" onClick={() => setSceneState((s) => s === 'CHAOS' ? 'FORMED' : 'CHAOS')}>
           {sceneState === 'CHAOS' ? '聚成树' : '散开'}
