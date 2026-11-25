@@ -221,6 +221,61 @@ canvas {
   pointer-events: none;
 }
 
+/* 本机保存结果提示 */
+.hud-saved {
+  position: absolute;
+  bottom: calc(124px + env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: #7CFFB2;
+  background: rgba(0, 40, 20, 0.7);
+  border: 1px solid rgba(124, 255, 178, 0.35);
+  padding: 6px 12px;
+  border-radius: 999px;
+  z-index: 11;
+  white-space: nowrap;
+  pointer-events: none;
+  max-width: 90vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 次要操作（清空照片等） */
+.chip.subtle {
+  border-color: rgba(255, 215, 0, 0.22);
+  color: rgba(255, 215, 0, 0.65);
+  font-weight: 500;
+}
+
+/* 看图页底部操作 */
+.viewer-actions {
+  position: absolute;
+  bottom: calc(64px + env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 10px;
+  z-index: 3;
+}
+.viewer-tip {
+  position: absolute;
+  bottom: calc(118px + env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: rgba(255, 215, 0, 0.85);
+  background: rgba(0, 0, 0, 0.65);
+  border: 1px solid rgba(255, 215, 0, 0.25);
+  padding: 5px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 3;
+}
+
 @media (max-width: 640px) {
   .hud-stats { display: none; }
   .hud-hint { bottom: calc(96px + env(safe-area-inset-bottom)); font-size: 10px; }

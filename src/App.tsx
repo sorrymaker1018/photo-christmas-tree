@@ -13,6 +13,7 @@ import * as THREE from 'three';
 import { MathUtils } from 'three';
 import * as random from 'maath/random';
 import { GestureRecognizer, FilesetResolver, DrawingUtils } from "@mediapipe/tasks-vision";
+import { addPhotos, clearPhotos as clearStoredPhotos, listPhotos, requestPersistence, type PhotoItem } from './photoStore';
 
 // --- 设备分级：低配手机自动进入轻量模式 ---
 const IS_SMALL_SCREEN = typeof window !== 'undefined'
@@ -72,6 +73,9 @@ const CONFIG = {
     body: DEFAULT_PHOTO_PATHS
   }
 };
+
+// 本机最多保存多少张照片（超出后自动丢弃最旧的）
+const MAX_STORED_PHOTOS = IS_LOW_END ? 24 : 48;
 
 // --- Shader Material (Foliage) ---
 const FoliageMaterial = shaderMaterial(
@@ -745,6 +749,55 @@ const PhotoViewer = ({ src, onClose }: { src: string; onClose: () => void }) => 
   const pinchStart = useRef(0);
   const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
   const gestureLast = useRef(0);
+  const [shareTip, setShareTip] = useState('');
+  const shareTimer = useRef<number | undefined>(undefined);
+
+  const tip = (msg: string) => {
+    setShareTip(msg);
+    if (shareTimer.current) window.clearTimeout(shareTimer.current);
+    shareTimer.current = window.setTimeout(() => setShareTip(''), 2400);
+  };
+  useEffect(() => () => { if (shareTimer.current) window.clearTimeout(shareTimer.current); }, []);
+
+  const toBlob = async (): Promise<Blob | null> => {
+    try {
+      const res = await fetch(src);
+      return await res.blob();
+    } catch {
+      return null;
+    }
+  };
+  const doSave = async () => {
+    const blob = await toBlob();
+    if (!blob) { tip('无法读取这张照片'); return; }
+    const name = `photo-${Date.now()}.jpg`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+    tip('已保存到相册 / 下载目录');
+  };
+  const doShare = async () => {
+    const blob = await toBlob();
+    if (!blob) { tip('无法读取这张照片'); return; }
+    const file = new File([blob], `photo-${Date.now()}.jpg`, { type: blob.type || 'image/jpeg' });
+    const nav = navigator as any;
+    if (nav.canShare && nav.canShare({ files: [file] })) {
+      try {
+        await nav.share({ files: [file], title: '我的照片' });
+      } catch (e: any) {
+        if (!e || e.name !== 'AbortError') tip('分享未完成，可用“保存”');
+      }
+    } else {
+      await doSave();
+      tip('当前浏览器不支持直接分享，已改为保存');
+    }
+  };
 
   // 手势缩放：拇指与食指张开的比例直接驱动照片 scale（增量式，不需要“起始基准”）
   useEffect(() => {
@@ -819,13 +872,19 @@ const PhotoViewer = ({ src, onClose }: { src: string; onClose: () => void }) => 
           style={{ transform: `perspective(1200px) rotateX(${view.rx}deg) rotateY(${view.ry}deg) scale(${view.s})` }}
         />
       </div>
+      <div className="viewer-actions" onClick={(e) => e.stopPropagation()}>
+        <button className="chip" onClick={doSave}>保存</button>
+        <button className="chip primary" onClick={doShare}>分享</button>
+      </div>
+      {shareTip && <div className="viewer-tip">{shareTip}</div>}
       <p className="viewer-hint">拖动旋转 · 双指或滚轮缩放<br />手势开启时：拇指食指张开放大 / 收拢缩小</p>
     </div>
   );
 };
 
-// --- 手机照片压缩（避免大图撑爆显存） ---
-const compressImage = async (file: File): Promise<string> => {
+// --- 手机照片压缩（避免大图撑爆显存；产出 Blob 便于保存到本机） ---
+type Compressed = { blob: Blob; width: number; height: number };
+const compressImage = async (file: File): Promise<Compressed> => {
   const MAX_EDGE = CONFIG.limits.maxPhotoEdge;
   try {
     const bitmap = await createImageBitmap(file);
@@ -837,14 +896,13 @@ const compressImage = async (file: File): Promise<string> => {
     if (!ctx) throw new Error('no canvas context');
     ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
     if (bitmap.close) bitmap.close();
-    return canvas.toDataURL('image/jpeg', 0.82);
-  } catch {
-    return await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result));
-      reader.onerror = () => reject(new Error('read failed'));
-      reader.readAsDataURL(file);
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob failed'))), 'image/jpeg', 0.82);
     });
+    return { blob, width: canvas.width, height: canvas.height };
+  } catch {
+    // 兜底：个别机型不支持 createImageBitmap（如部分 HEIC），直接用原文件
+    return { blob: file, width: 0, height: 0 };
   }
 };
 
@@ -858,9 +916,78 @@ export default function GrandTreeApp() {
   const [photoUrls, setPhotoUrls] = useState<string[]>(DEFAULT_PHOTO_PATHS);
   const [uploading, setUploading] = useState(false);
   const [uploadCount, setUploadCount] = useState(0);
+  const [saveHint, setSaveHint] = useState('');
   const [selectedPhoto, setSelectedPhoto] = useState<string | null>(DEBUG_OPEN_VIEWER ? DEFAULT_PHOTO_PATHS[1] : null);
   const [detectedName, setDetectedName] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
+  const urlByIdRef = useRef<Map<number, string>>(new Map());
+
+  // 把照片集合同步到画面；objectURL 按 id 复用，避免重复解码
+  const applyPhotoSet = useCallback((items: PhotoItem[]) => {
+    const next: string[] = [];
+    const keepIds = new Set<number>();
+    for (const it of items) {
+      const id = it.id as number;
+      if (typeof id !== 'number') continue;
+      keepIds.add(id);
+      let url = urlByIdRef.current.get(id);
+      if (!url) {
+        url = URL.createObjectURL(it.blob);
+        urlByIdRef.current.set(id, url);
+      }
+      next.push(url);
+    }
+    for (const [id, url] of Array.from(urlByIdRef.current)) {
+      if (!keepIds.has(id)) {
+        URL.revokeObjectURL(url);
+        urlByIdRef.current.delete(id);
+      }
+    }
+    setPhotoUrls(next.length ? next : DEFAULT_PHOTO_PATHS);
+    setUploadCount(next.length);
+    setSceneState('FORMED');
+  }, []);
+
+  // 打开页面先读本机照片库：有就用自己的照片，没有就用示例图
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const saved = await listPhotos();
+        if (!alive || !saved.length) return;
+        applyPhotoSet(saved);
+      } catch {
+        // 隐私模式 / 浏览器不支持时静默降级
+      }
+    })();
+    return () => {
+      alive = false;
+      for (const url of Array.from(urlByIdRef.current.values())) URL.revokeObjectURL(url);
+      urlByIdRef.current.clear();
+    };
+  }, [applyPhotoSet]);
+
+  // 保存结果提示 2.6 秒后自动消失
+  useEffect(() => {
+    if (!saveHint) return;
+    const t = window.setTimeout(() => setSaveHint(''), 2600);
+    return () => window.clearTimeout(t);
+  }, [saveHint]);
+
+  const clearMyPhotos = async () => {
+    if (!uploadCount) return;
+    if (!window.confirm('清空本机保存的照片？手机相册里的原图不会被删除。')) return;
+    try {
+      await clearStoredPhotos();
+    } catch {
+      // ignore
+    }
+    for (const url of Array.from(urlByIdRef.current.values())) URL.revokeObjectURL(url);
+    urlByIdRef.current.clear();
+    setPhotoUrls(DEFAULT_PHOTO_PATHS);
+    setUploadCount(0);
+    setSaveHint('已清空，恢复为示例照片');
+  };
 
   const handleFiles = async (files: FileList | null) => {
     if (!files || !files.length) return;
@@ -870,12 +997,26 @@ export default function GrandTreeApp() {
       for (const f of Array.from(files)) {
         if (f.type.startsWith('image/') && picked.length < CONFIG.limits.maxPhotos) picked.push(f);
       }
-      const urls: string[] = [];
-      for (const f of picked) urls.push(await compressImage(f));
-      if (urls.length) {
-        setPhotoUrls(urls);
-        setUploadCount(urls.length);
-        setSceneState('FORMED');
+      if (!picked.length) return;
+      const items: Omit<PhotoItem, 'id' | 'addedAt'>[] = [];
+      for (const f of picked) {
+        const c = await compressImage(f);
+        items.push({ name: f.name, type: c.blob.type || 'image/jpeg', blob: c.blob, width: c.width, height: c.height });
+      }
+      let stored: PhotoItem[] | null = null;
+      try {
+        stored = await addPhotos(items, MAX_STORED_PHOTOS);
+        void requestPersistence();
+      } catch {
+        stored = null;
+      }
+      if (stored && stored.length) {
+        applyPhotoSet(stored);
+        setSaveHint(`已存入本机 ${items.length} 张 · 共 ${stored.length} 张`);
+      } else {
+        // 浏览器不允许持久化时，退化为仅本次会话可见
+        applyPhotoSet(items.map((it, i) => ({ ...it, id: -(Date.now() + i), addedAt: Date.now() } as PhotoItem)));
+        setSaveHint('浏览器不允许本地保存，本次仅临时显示');
       }
     } finally {
       setUploading(false);
@@ -944,6 +1085,8 @@ export default function GrandTreeApp() {
         <div className="hud-detected">{detectedName}</div>
       )}
 
+      {saveHint && <div className="hud-saved">{saveHint}</div>}
+
       <div className="hud-hint">
         {gestureOn
           ? '握拳聚树 · 张开散开 · 左右移动旋转 · 点照片放大'
@@ -965,6 +1108,9 @@ export default function GrandTreeApp() {
         <button className="chip primary" onClick={() => fileRef.current?.click()} disabled={uploading}>
           {uploading ? '导入中…' : '＋ 导入照片'}
         </button>
+        {uploadCount > 0 && (
+          <button className="chip subtle" onClick={clearMyPhotos}>清空照片</button>
+        )}
         <button className="chip" onClick={() => setSceneState((s) => s === 'CHAOS' ? 'FORMED' : 'CHAOS')}>
           {sceneState === 'CHAOS' ? '聚成树' : '散开'}
         </button>
