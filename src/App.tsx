@@ -25,6 +25,11 @@ const FORCE_LITE = typeof location !== 'undefined' && new URLSearchParams(locati
 const FORCE_FULL = typeof location !== 'undefined' && new URLSearchParams(location.search).has('full');
 const IS_LOW_END = FORCE_LITE || (!FORCE_FULL && IS_SMALL_SCREEN && ((DEVICE_MEMORY !== undefined && DEVICE_MEMORY <= 2) || CPU_CORES <= 4));
 
+// 微信内置浏览器基本不允许网页调用摄像头，先直接提示换浏览器
+const IS_WECHAT = typeof navigator !== 'undefined' && /MicroMessenger/i.test(navigator.userAgent);
+// 版本标记，方便确认手机上是不是新版本
+const BUILD_TAG = 'v25c';
+
 // --- 默认照片列表（用小尺寸图，省显存；用户上传后整体替换） ---
 const BASE = import.meta.env.BASE_URL;
 const DEFAULT_PHOTO_DIR = `${BASE}${IS_LOW_END ? 'photos-512' : 'photos-768'}`;
@@ -550,6 +555,8 @@ const GestureController = ({ onGesture, onMove, onStatus, onDetect, onPinch, pin
     let candidateHits = 0;
     let lastEmitAt = 0;
     let lastEmitted = '';
+    let fpsCount = 0;
+    let fpsAt = performance.now();
 
     const dist = (a: any, b: any) => Math.hypot(a.x - b.x, a.y - b.y);
     // 用 21 个手部关键点自己数伸出的手指，模型置信度低时兜底
@@ -647,6 +654,18 @@ const GestureController = ({ onGesture, onMove, onStatus, onDetect, onPinch, pin
       }
 
       if (!pinching && score >= 0.55 && (name === 'Closed_Fist' || name === 'Open_Palm')) emit(name);
+
+      // 帧率回显：让你一眼确认推理真的在跑（不显示帧率就是没跑起来）
+      if (!pinching) {
+        fpsCount += 1;
+        const nowMs = performance.now();
+        if (nowMs - fpsAt >= 1500) {
+          const fps = Math.round((fpsCount * 1000) / (nowMs - fpsAt));
+          onStatus(`AI 就绪 · ${fps} 帧/秒`);
+          fpsCount = 0;
+          fpsAt = nowMs;
+        }
+      }
     };
 
     const tick = () => {
@@ -687,16 +706,20 @@ const GestureController = ({ onGesture, onMove, onStatus, onDetect, onPinch, pin
           minHandPresenceConfidence: 0.4,
           minTrackingConfidence: 0.4
         });
-        // 低配机 CPU 推理通常比 GPU 更稳（不会和 3D 场景抢显存/带宽），高端机优先 GPU
-        const preferred: 'GPU' | 'CPU' = IS_LOW_END ? 'CPU' : 'GPU';
+        // 手机上 CPU 推理最稳（Safari 的 GPU 委托兼容性差），只有桌面浏览器才用 GPU
+        const preferred: 'GPU' | 'CPU' = IS_SMALL_SCREEN ? 'CPU' : 'GPU';
         const fallback: 'GPU' | 'CPU' = preferred === 'GPU' ? 'CPU' : 'GPU';
         try { gestureRecognizer = await makeRecognizer(preferred); }
         catch { gestureRecognizer = await makeRecognizer(fallback); }
         if (cancelled) return;
 
+        if (!navigator.mediaDevices?.getUserMedia) {
+          onStatus('ERROR: 当前浏览器不支持摄像头（请用 Safari / Chrome 打开）');
+          return;
+        }
         onStatus('请求摄像头权限…');
         stream = await navigator.mediaDevices.getUserMedia({
-          video: IS_LOW_END
+          video: IS_SMALL_SCREEN
             ? { facingMode: 'user', width: { ideal: 480 }, height: { ideal: 360 }, frameRate: { ideal: 24, max: 30 } }
             : { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
           audio: false
@@ -705,11 +728,22 @@ const GestureController = ({ onGesture, onMove, onStatus, onDetect, onPinch, pin
         const track = stream.getVideoTracks()[0];
         try { await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] } as any); } catch { /* 部分机型不支持 */ }
 
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          try { await videoRef.current.play(); } catch { /* ignore */ }
-          onStatus('AI 就绪 · 把手放进画面');
-          schedule();
+        const video = videoRef.current as any;
+        if (video) {
+          video.muted = true;
+          video.playsInline = true;
+          video.srcObject = stream;
+          // iOS 在长时间 await 之后可能丢掉“用户手势”，首次 play 可能被拒，这里再试一次并给出提示
+          try { await video.play(); } catch { /* ignore */ }
+          if (video.paused) { try { await video.play(); } catch { /* ignore */ } }
+          if (video.paused) {
+            onStatus('摄像头未启动 · 点一下屏幕重试');
+            const retry = () => { video.play().catch(() => {}); };
+            window.addEventListener('pointerdown', retry, { once: true });
+          } else {
+            onStatus('AI 就绪 · 把手放进画面');
+            schedule();
+          }
         }
       } catch (err: any) {
         const msg = String(err?.message || err);
@@ -956,6 +990,7 @@ export default function GrandTreeApp() {
         const saved = await listPhotos();
         if (!alive || !saved.length) return;
         applyPhotoSet(saved);
+        setSaveHint(`已加载本机 ${saved.length} 张照片`);
       } catch {
         // 隐私模式 / 浏览器不支持时静默降级
       }
@@ -967,10 +1002,11 @@ export default function GrandTreeApp() {
     };
   }, [applyPhotoSet]);
 
-  // 保存结果提示 2.6 秒后自动消失
+  // 保存结果提示：导入/清空 2.6 秒，加载已有照片 4.5 秒（免得一打开就错过）
   useEffect(() => {
     if (!saveHint) return;
-    const t = window.setTimeout(() => setSaveHint(''), 2600);
+    const ms = saveHint.startsWith('已加载') ? 4500 : 2600;
+    const t = window.setTimeout(() => setSaveHint(''), ms);
     return () => window.clearTimeout(t);
   }, [saveHint]);
 
@@ -1086,6 +1122,10 @@ export default function GrandTreeApp() {
       )}
 
       {saveHint && <div className="hud-saved">{saveHint}</div>}
+      {IS_WECHAT && (
+        <div className="hud-warn">微信内无法使用摄像头 · 点右上角「…」选“在浏览器打开”</div>
+      )}
+      <div className="hud-build">{BUILD_TAG}</div>
 
       <div className="hud-hint">
         {gestureOn
@@ -1100,7 +1140,7 @@ export default function GrandTreeApp() {
         <input
           ref={fileRef}
           type="file"
-          accept="image/jpeg,image/png,image/webp"
+          accept="image/*"
           multiple
           style={{ display: 'none' }}
           onChange={(e) => handleFiles(e.target.files)}

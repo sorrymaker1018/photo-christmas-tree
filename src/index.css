@@ -276,6 +276,36 @@ canvas {
   z-index: 3;
 }
 
+/* 微信内提示 */
+.hud-warn {
+  position: absolute;
+  top: calc(46px + env(safe-area-inset-top));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 12;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #FFB4A2;
+  background: rgba(60, 10, 0, 0.8);
+  border: 1px solid rgba(255, 120, 90, 0.5);
+  padding: 6px 12px;
+  border-radius: 12px;
+  max-width: 86vw;
+  text-align: center;
+}
+
+/* 版本标记 */
+.hud-build {
+  position: absolute;
+  right: 12px;
+  bottom: calc(96px + env(safe-area-inset-bottom));
+  z-index: 10;
+  font-size: 9px;
+  letter-spacing: 1px;
+  color: rgba(255, 255, 255, 0.28);
+  pointer-events: none;
+}
+
 @media (max-width: 640px) {
   .hud-stats { display: none; }
   .hud-hint { bottom: calc(96px + env(safe-area-inset-bottom)); font-size: 10px; }
