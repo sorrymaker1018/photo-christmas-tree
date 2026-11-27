@@ -32,7 +32,7 @@ const IS_LOW_END = FORCE_LITE || (!FORCE_FULL && IS_SMALL_SCREEN && ((DEVICE_MEM
 // 微信内置浏览器基本不允许网页调用摄像头，先直接提示换浏览器
 const IS_WECHAT = typeof navigator !== 'undefined' && /MicroMessenger/i.test(navigator.userAgent);
 // 版本标记，方便确认手机上是不是新版本
-const BUILD_TAG = 'v26b';
+const BUILD_TAG = 'v26c';
 
 // --- 默认照片列表（用小尺寸图，省显存；用户上传后整体替换） ---
 const BASE = import.meta.env.BASE_URL;
@@ -656,7 +656,7 @@ const GestureController = ({ onGesture, onMove, onStatus, onDetect, onPinch, pin
           pinchHandRef.current = false;
           window.dispatchEvent(new Event('gesture-pinch-end'));
         }
-        if (debugRef.current) onStatus(pinching ? 'AI 就绪 · 手势缩放待检测' : 'AI 就绪 · 未检测到手');
+        if (debugRef.current) onStatus(pinching ? 'AI 就绪 · 手势缩放待检测' : 'AI 就绪 · 未见手');
       }
 
       if (!pinching && score >= 0.55 && (name === 'Closed_Fist' || name === 'Open_Palm')) emit(name, score);
@@ -667,8 +667,8 @@ const GestureController = ({ onGesture, onMove, onStatus, onDetect, onPinch, pin
         const nowMs = performance.now();
         if (nowMs - fpsAt >= 1500) {
           const fps = Math.round((fpsCount * 1000) / (nowMs - fpsAt));
-          const handTxt = performance.now() - lastHandAt > 4000 ? ' · 未检测到手' : '';
-          onStatus(`AI 就绪 · ${fps} 帧/秒${handTxt}`);
+          const handTxt = performance.now() - lastHandAt > 4000 ? ' · 未见手' : '';
+          onStatus(`AI 就绪 · ${fps}fps${handTxt}`);
           fpsCount = 0;
           fpsAt = nowMs;
         }
