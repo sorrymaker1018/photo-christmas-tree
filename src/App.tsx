@@ -32,7 +32,7 @@ const IS_LOW_END = FORCE_LITE || (!FORCE_FULL && IS_SMALL_SCREEN && ((DEVICE_MEM
 // 微信内置浏览器基本不允许网页调用摄像头，先直接提示换浏览器
 const IS_WECHAT = typeof navigator !== 'undefined' && /MicroMessenger/i.test(navigator.userAgent);
 // 版本标记，方便确认手机上是不是新版本
-const BUILD_TAG = 'v26a';
+const BUILD_TAG = 'v26b';
 
 // --- 默认照片列表（用小尺寸图，省显存；用户上传后整体替换） ---
 const BASE = import.meta.env.BASE_URL;
@@ -700,55 +700,50 @@ const GestureController = ({ onGesture, onMove, onStatus, onDetect, onPinch, pin
       }
     };
 
-    // 带进度下载模型（8.4MB，手机上要几秒，给百分比免得以为卡死）
+    // 带进度下载模型（8.4MB）：10 秒没有新数据就中止，避免永远停在某个百分比
     const fetchModelBuffer = async (url: string) => {
-      const res = await fetch(url, { cache: 'force-cache' });
-      if (!res.ok || !res.body) throw new Error(`模型下载失败 HTTP ${res.status}`);
-      const total = Number(res.headers.get('content-length') || 0);
-      const reader = res.body.getReader();
-      const chunks: Uint8Array[] = [];
-      let received = 0;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) {
-          chunks.push(value);
-          received += value.byteLength;
-          onStatus(total
-            ? `加载手势模型 ${Math.min(99, Math.round((received / total) * 100))}%`
-            : `加载手势模型 ${(received / 1048576).toFixed(1)}MB`);
+      const ac = new AbortController();
+      let lastAt = Date.now();
+      const watchdog = window.setInterval(() => {
+        if (Date.now() - lastAt > 12000) ac.abort();
+      }, 2000);
+      try {
+        const res = await fetch(url, { cache: 'force-cache', signal: ac.signal });
+        if (!res.ok || !res.body) throw new Error(`模型下载失败 HTTP ${res.status}`);
+        const total = Number(res.headers.get('content-length') || 0);
+        const reader = res.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let received = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          lastAt = Date.now();
+          if (value) {
+            chunks.push(value);
+            received += value.byteLength;
+            const mb = (received / 1048576).toFixed(1);
+            onStatus(total
+              ? `下载手势模型 ${Math.min(100, Math.round((received / total) * 100))}% · ${mb}MB`
+              : `下载手势模型 ${mb}MB`);
+          }
         }
+        const out = new Uint8Array(received);
+        let off = 0;
+        for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+        return out;
+      } finally {
+        window.clearInterval(watchdog);
       }
-      const out = new Uint8Array(received);
-      let off = 0;
-      for (const c of chunks) { out.set(c, off); off += c.byteLength; }
-      return out;
     };
 
-    const setup = async () => {
-      onStatus('加载手势引擎…');
-      try {
-        const vision = await FilesetResolver.forVisionTasks(`${BASE}mediapipe/wasm`);
-        const modelBuffer = await fetchModelBuffer(`${BASE}models/gesture_recognizer.task`);
-        if (cancelled) return;
-        const makeRecognizer = (delegate: 'GPU' | 'CPU') => GestureRecognizer.createFromOptions(vision, {
-          baseOptions: { modelAssetBuffer: modelBuffer, delegate },
-          runningMode: 'VIDEO',
-          numHands: 1,
-          // 调低门槛，手离得远一点、光线差一点也能先“抓住”手
-          minHandDetectionConfidence: 0.3,
-          minHandPresenceConfidence: 0.3,
-          minTrackingConfidence: 0.35
-        });
-        // 手机上 CPU 推理最稳（Safari 的 GPU 委托兼容性差），只有桌面浏览器才用 GPU
-        const preferred: 'GPU' | 'CPU' = IS_SMALL_SCREEN ? 'CPU' : 'GPU';
-        const fallback: 'GPU' | 'CPU' = preferred === 'GPU' ? 'CPU' : 'GPU';
-        try { gestureRecognizer = await makeRecognizer(preferred); }
-        catch { gestureRecognizer = await makeRecognizer(fallback); }
-        if (cancelled) return;
+    const withTimeout = <T,>(p: Promise<T>, ms: number, label: string) =>
+      Promise.race([p, new Promise<T>((_, reject) => { window.setTimeout(() => reject(new Error(label)), ms); })]);
 
+    const setup = async () => {
+      try {
+        // 1) 摄像头优先：权限提示尽早弹，画面先出来，模型在后面慢慢编译
         if (!navigator.mediaDevices?.getUserMedia) {
-          onStatus('ERROR: 当前浏览器不支持摄像头（请用 Safari / Chrome 打开）');
+          onStatus('ERROR: 当前浏览器不支持摄像头（请换 Safari / Chrome 打开）');
           return;
         }
         onStatus('请求摄像头权限…');
@@ -767,24 +762,74 @@ const GestureController = ({ onGesture, onMove, onStatus, onDetect, onPinch, pin
           video.muted = true;
           video.playsInline = true;
           video.srcObject = stream;
-          // iOS 在长时间 await 之后可能丢掉“用户手势”，首次 play 可能被拒，这里再试一次并给出提示
           try { await video.play(); } catch { /* ignore */ }
           if (video.paused) { try { await video.play(); } catch { /* ignore */ } }
           if (video.paused) {
-            onStatus('摄像头未启动 · 点一下屏幕重试');
-            const retry = () => { video.play().catch(() => {}); };
-            window.addEventListener('pointerdown', retry, { once: true });
+            onStatus('摄像头已授权 · 点一下屏幕开始');
+            window.addEventListener('pointerdown', () => { video.play().catch(() => {}); }, { once: true });
           } else {
-            onStatus('AI 就绪 · 把手放进画面');
-            schedule();
+            onStatus('摄像头就绪 · 准备 AI 引擎…');
           }
+        }
+
+        // 2) 引擎 + 模型：下载有百分比，编译有计时，超时会报错而不是一直转
+        onStatus('加载 AI 引擎…');
+        const vision = await withTimeout(
+          FilesetResolver.forVisionTasks(`${BASE}mediapipe/wasm`), 30000, 'AI 引擎加载超时',
+        );
+        if (cancelled) return;
+        onStatus('下载手势模型 0%');
+        const modelBuffer = await fetchModelBuffer(`${BASE}models/gesture_recognizer.task`);
+        if (cancelled) return;
+
+        const makeRecognizer = (delegate: 'GPU' | 'CPU') => GestureRecognizer.createFromOptions(vision, {
+          baseOptions: { modelAssetBuffer: modelBuffer, delegate },
+          runningMode: 'VIDEO',
+          numHands: 1,
+          // 调低门槛，手离得远一点、光线差一点也能先“抓住”手
+          minHandDetectionConfidence: 0.3,
+          minHandPresenceConfidence: 0.3,
+          minTrackingConfidence: 0.35
+        });
+        // iPhone / iPad 用 CPU 最稳；安卓（含华为浏览器）优先 GPU，失败再退回 CPU
+        const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+        const preferred: 'GPU' | 'CPU' = isIOS ? 'CPU' : 'GPU';
+        const fallback: 'GPU' | 'CPU' = preferred === 'GPU' ? 'CPU' : 'GPU';
+
+        onStatus('模型已下载 · 正在编译（首次 10~30 秒，画面会卡一下）');
+        await new Promise<void>((resolve) => {
+          requestAnimationFrame(() => { window.setTimeout(() => resolve(), 60); });
+        });
+        const t0 = performance.now();
+        const ticker = window.setInterval(() => {
+          if (!cancelled) onStatus(`模型编译中 ${Math.round((performance.now() - t0) / 1000)}s · 首次较慢`);
+        }, 2500);
+        try {
+          gestureRecognizer = await withTimeout(makeRecognizer(preferred), 45000, '模型编译超时（点「手势 OFF→ON」重试）');
+        } catch {
+          gestureRecognizer = await withTimeout(makeRecognizer(fallback), 45000, '模型编译失败（点「手势 OFF→ON」重试）');
+        } finally {
+          window.clearInterval(ticker);
+        }
+        if (cancelled) return;
+
+        if (video && video.paused) { try { await video.play(); } catch { /* ignore */ } }
+        if (video && video.paused) {
+          onStatus('模型就绪 · 点一下屏幕开始');
+          window.addEventListener('pointerdown', () => { video.play().catch(() => {}); }, { once: true });
+        } else {
+          onStatus('AI 就绪 · 把手放进画面');
+          schedule();
         }
       } catch (err: any) {
         const msg = String(err?.message || err);
-        if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+        const name = String(err?.name || '');
+        if (name === 'NotAllowedError' || /denied|permission/i.test(msg)) {
+          onStatus('ERROR: 摄像头权限被拒绝 · 浏览器设置里允许后点「手势 OFF→ON」重试');
+        } else if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
           onStatus('需要 HTTPS 才能使用摄像头');
         } else {
-          onStatus(`ERROR: ${msg.slice(0, 70)}`);
+          onStatus(`ERROR: ${msg.slice(0, 60)}`);
         }
       }
     };
@@ -1369,3 +1414,4 @@ export default function GrandTreeApp() {
     </div>
   );
 }
+
